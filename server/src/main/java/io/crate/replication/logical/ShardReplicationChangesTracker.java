@@ -27,6 +27,7 @@ import io.crate.execution.support.RetryListener;
 import io.crate.execution.support.RetryRunnable;
 import io.crate.replication.logical.action.ReplayChangesAction;
 import io.crate.replication.logical.action.ShardChangesAction;
+import io.crate.replication.logical.action.ShardChangesAction.Response;
 import io.crate.replication.logical.seqno.RetentionLeaseHelper;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchTimeoutException;
@@ -216,7 +217,23 @@ public class ShardReplicationChangesTracker implements Closeable {
         shardReplicationService.getRemoteClusterClient(shardId.getIndex())
             .whenComplete((client, err) -> {
                 if (err == null) {
-                    client.execute(ShardChangesAction.INSTANCE, request, ActionListener.wrap(onSuccess, onFailure));
+                    // TODO: revert, just for debugging
+                    client.execute(ShardChangesAction.INSTANCE, request, new ActionListener<>() {
+
+                        @Override
+                        public void onResponse(Response response) {
+                            try {
+                                onSuccess.accept(response);
+                            } catch (Exception e) {
+                                onFailure.accept(e);
+                            }
+                        }
+
+                        @Override
+                        public void onFailure(Exception e) {
+                            onFailure.accept(e);
+                        }
+                    });
                 } else {
                     onFailure.accept(Exceptions.toException(err));
                 }

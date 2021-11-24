@@ -147,7 +147,7 @@ public class ThreadPool implements Scheduler {
             TimeValue.timeValueMillis(200), TimeValue.ZERO, Setting.Property.NodeScope);
 
     public ThreadPool(final Settings settings) {
-        assert Node.NODE_NAME_SETTING.exists(settings);
+        assert Node.NODE_NAME_SETTING.exists(settings) : "Settings for threadPool must have a node.name property";
 
         final HashMap<String, ExecutorBuilder> builders = new HashMap<>();
         final int availableProcessors = EsExecutors.numberOfProcessors(settings);

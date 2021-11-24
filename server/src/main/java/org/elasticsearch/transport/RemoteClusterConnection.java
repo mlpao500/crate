@@ -69,7 +69,7 @@ public final class RemoteClusterConnection implements Closeable {
         ConnectionProfile profile = RemoteConnectionStrategy.buildConnectionProfile(nodeSettings, connectionSettings);
         this.remoteConnectionManager = new RemoteConnectionManager(clusterAlias,
                                                                    createConnectionManager(profile, transportService));
-        this.connectionStrategy = RemoteConnectionStrategy.buildStrategy(
+        this.connectionStrategy = new SniffConnectionStrategy(
             clusterAlias,
             transportService,
             remoteConnectionManager,
@@ -183,9 +183,5 @@ public final class RemoteClusterConnection implements Closeable {
 
     ConnectionManager getConnectionManager() {
         return remoteConnectionManager;
-    }
-
-    public boolean shouldRebuildConnection(Settings newSettings) {
-        return connectionStrategy.shouldRebuildConnection(newSettings);
     }
 }

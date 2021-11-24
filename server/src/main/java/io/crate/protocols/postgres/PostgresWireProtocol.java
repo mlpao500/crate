@@ -34,6 +34,7 @@ import io.crate.user.User;
 import io.crate.common.annotations.VisibleForTesting;
 import io.crate.common.collections.Lists2;
 import io.crate.expression.symbol.Symbol;
+import io.crate.protocols.SSL;
 import io.crate.protocols.postgres.types.PGType;
 import io.crate.protocols.postgres.types.PGTypes;
 import io.crate.protocols.ssl.SslContextProvider;
@@ -52,8 +53,6 @@ import org.apache.logging.log4j.Logger;
 import org.elasticsearch.Version;
 import org.elasticsearch.http.netty4.Netty4HttpServerTransport;
 
-import javax.annotation.Nullable;
-import javax.net.ssl.SSLSession;
 import java.net.InetAddress;
 import java.net.SocketException;
 import java.nio.ByteBuffer;
@@ -66,12 +65,40 @@ import java.util.Locale;
 import java.util.Properties;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
-import static io.crate.protocols.SSL.getSession;
-import static io.crate.protocols.postgres.FormatCodes.getFormatCode;
-import static io.crate.protocols.postgres.PostgresWireProtocol.State.PRE_STARTUP;
-import static io.crate.protocols.postgres.PostgresWireProtocol.State.STARTUP_HEADER;
+import javax.annotation.Nullable;
+import javax.net.ssl.SSLSession;
+
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.Version;
+import org.elasticsearch.http.netty4.Netty4HttpServerTransport;
+
+import io.crate.action.sql.DescribeResult;
+import io.crate.action.sql.ResultReceiver;
+import io.crate.action.sql.SQLOperations;
+import io.crate.action.sql.Session;
+import io.crate.action.sql.SessionContext;
+import io.crate.auth.AccessControl;
+import io.crate.auth.Authentication;
+import io.crate.auth.AuthenticationMethod;
+import io.crate.auth.Protocol;
+import io.crate.common.annotations.VisibleForTesting;
+import io.crate.common.collections.Lists2;
+import io.crate.expression.symbol.Symbol;
+import io.crate.protocols.postgres.types.PGType;
+import io.crate.protocols.postgres.types.PGTypes;
+import io.crate.protocols.ssl.SslContextProvider;
+import io.crate.types.DataType;
+import io.crate.user.User;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPipeline;
+import io.netty.channel.SimpleChannelInboundHandler;
+import io.netty.handler.codec.ByteToMessageDecoder;
 
 
 /**
@@ -196,6 +223,7 @@ public class PostgresWireProtocol {
     private final Function<SessionContext, AccessControl> getAccessControl;
     private final Authentication authService;
     private final SslReqHandler sslReqHandler;
+    private final Consumer<ChannelPipeline> addTransportHandler;
 
     private DelayableWriteChannel channel;
     private int msgLength;
@@ -213,14 +241,16 @@ public class PostgresWireProtocol {
         MSG_BODY
     }
 
-    private State state = PRE_STARTUP;
+    private State state = State.PRE_STARTUP;
 
     PostgresWireProtocol(SQLOperations sqlOperations,
                          Function<SessionContext, AccessControl> getAcessControl,
+                         Consumer<ChannelPipeline> addTransportHandler,
                          Authentication authService,
                          @Nullable SslContextProvider sslContextProvider) {
         this.sqlOperations = sqlOperations;
         this.getAccessControl = getAcessControl;
+        this.addTransportHandler = addTransportHandler;
         this.authService = authService;
         this.sslReqHandler = new SslReqHandler(sslContextProvider);
         this.decoder = new MessageDecoder();
@@ -424,7 +454,7 @@ public class PostgresWireProtocol {
         String userName = properties.getProperty("user");
         InetAddress address = Netty4HttpServerTransport.getRemoteAddress(channel);
 
-        SSLSession sslSession = getSession(channel);
+        SSLSession sslSession = SSL.getSession(channel);
         ConnectionProperties connProperties = new ConnectionProperties(address, Protocol.POSTGRES, sslSession);
 
         AuthenticationMethod authMethod = authService.resolveAuthenticationType(userName, connProperties);
@@ -453,12 +483,25 @@ public class PostgresWireProtocol {
             session = sqlOperations.createSession(database, authenticatedUser);
             Messages.sendAuthenticationOK(channel)
                 .addListener(f -> sendParamsAndRdyForQuery(channel));
+
+            if (properties.containsKey("CrateDBTransport")) {
+                switchToTransportProtocol(channel);
+            }
         } catch (Exception e) {
             Messages.sendAuthenticationError(channel, e.getMessage());
         } finally {
             authContext.close();
             authContext = null;
         }
+    }
+
+    private void switchToTransportProtocol(Channel channel) {
+        var pipeline = channel.pipeline();
+        pipeline.remove("frame-decoder");
+        pipeline.remove("handler");
+
+        // SSL is already done via PostgreSQL handshake/auth
+        addTransportHandler.accept(pipeline);
     }
 
     private void sendParamsAndRdyForQuery(Channel channel) {
@@ -564,7 +607,7 @@ public class PostgresWireProtocol {
             } else {
                 DataType paramType = session.getParamType(statementName, i);
                 PGType pgType = PGTypes.get(paramType);
-                FormatCodes.FormatCode formatCode = getFormatCode(formatCodes, i);
+                FormatCodes.FormatCode formatCode = FormatCodes.getFormatCode(formatCodes, i);
                 switch (formatCode) {
                     case TEXT:
                         params.add(pgType.readTextValue(buffer, valueLength));
@@ -813,7 +856,7 @@ public class PostgresWireProtocol {
             switch (state) {
                 case PRE_STARTUP:
                     if (sslReqHandler.process(buffer, pipeline) == SslReqHandler.State.DONE) {
-                        state = STARTUP_HEADER;
+                        state = State.STARTUP_HEADER;
                         // We need to call decode again in case there are additional bytes in the buffer
                         return decode(buffer, pipeline);
                     } else {

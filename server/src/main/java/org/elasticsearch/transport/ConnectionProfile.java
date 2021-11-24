@@ -321,6 +321,10 @@ public final class ConnectionProfile {
             if (length == 0) {
                 throw new IllegalStateException("can't select channel size is 0 for types: " + types);
             }
+            // FIXME: remove
+            if (true) {
+                return channels.get(0);
+            }
             assert channels.size() >= offset + length : "illegal size: " + channels.size() + " expected >= " + (offset + length);
             return channels.get(offset + Math.floorMod(counter.incrementAndGet(), length));
         }

@@ -33,6 +33,7 @@ import io.crate.expression.tablefunctions.TableFunctionModule;
 import io.crate.metadata.settings.session.SessionSettingModule;
 import io.crate.netty.NettyBootstrap;
 import io.crate.plugin.CopyPlugin;
+import io.crate.protocols.postgres.PgClientFactory;
 import io.crate.protocols.ssl.SslContextProvider;
 import io.crate.replication.logical.LogicalReplicationService;
 import io.crate.types.DataTypes;
@@ -506,7 +507,7 @@ public class Node implements Closeable {
                                                                                                             settingsModule.getIndexScopedSettings(),
                                                                                                             indexMetadataUpgraders);
             new TemplateUpgradeService(client, clusterService, threadPool, indexTemplateMetadataUpgraders);
-            final Transport transport = new Netty4Transport(
+            final Netty4Transport transport = new Netty4Transport(
                 settings,
                 Version.CURRENT,
                 threadPool,
@@ -528,7 +529,14 @@ public class Node implements Closeable {
             final GatewayMetaState gatewayMetaState = new GatewayMetaState();
             final HttpServerTransport httpServerTransport = newHttpTransport(networkModule);
 
-            RemoteClusters remoteClusters = new RemoteClusters(settings, threadPool, transportService);
+            PgClientFactory pgClientFactory = new PgClientFactory(
+                settings,
+                transportService,
+                transport,
+                pageCacheRecycler,
+                nettyBootstrap
+            );
+            RemoteClusters remoteClusters = new RemoteClusters(settings, threadPool, pgClientFactory, transportService);
             resourcesToClose.add(remoteClusters);
             final LogicalReplicationService logicalReplicationService = new LogicalReplicationService(
                 settingsModule.getIndexScopedSettings(),
@@ -629,6 +637,7 @@ public class Node implements Closeable {
                     b.bind(IndicesService.class).toInstance(indicesService);
                     b.bind(AliasValidator.class).toInstance(aliasValidator);
                     b.bind(MetadataCreateIndexService.class).toInstance(metadataCreateIndexService);
+                    b.bind(Netty4Transport.class).toInstance(transport);
                     b.bind(Transport.class).toInstance(transport);
                     b.bind(TransportService.class).toInstance(transportService);
                     b.bind(NetworkService.class).toInstance(networkService);

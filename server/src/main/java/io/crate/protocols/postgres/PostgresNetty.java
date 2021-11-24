@@ -48,9 +48,13 @@ import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.transport.BoundTransportAddress;
 import org.elasticsearch.common.transport.PortsRange;
 import org.elasticsearch.common.transport.TransportAddress;
+import org.elasticsearch.common.util.PageCacheRecycler;
 import org.elasticsearch.http.BindHttpException;
 import org.elasticsearch.transport.BindTransportException;
+import org.elasticsearch.transport.netty4.Netty4MessageChannelHandler;
 import org.elasticsearch.transport.netty4.Netty4OpenChannelsHandler;
+import org.elasticsearch.transport.netty4.Netty4TcpChannel;
+import org.elasticsearch.transport.netty4.Netty4Transport;
 
 import io.crate.action.sql.SQLOperations;
 import io.crate.auth.Authentication;
@@ -101,12 +105,17 @@ public class PostgresNetty extends AbstractLifecycleComponent {
 
     private final List<Channel> serverChannels = new ArrayList<>();
     private final List<TransportAddress> boundAddresses = new ArrayList<>();
+    private final Netty4Transport transport;
+    private final PageCacheRecycler pageCacheRecycler;
+
     @Nullable
     private BoundTransportAddress boundAddress;
     @Nullable
     private Netty4OpenChannelsHandler openChannels;
 
     private BorrowedItem<EventLoopGroup> eventLoopGroup;
+
+
 
 
     @Inject
@@ -116,6 +125,8 @@ public class PostgresNetty extends AbstractLifecycleComponent {
                          NetworkService networkService,
                          Authentication authentication,
                          NettyBootstrap nettyBootstrap,
+                         Netty4Transport transport,
+                         PageCacheRecycler pageCacheRecycler,
                          SslContextProvider sslContextProvider) {
         this.settings = settings;
         this.userManager = userManager;
@@ -124,6 +135,8 @@ public class PostgresNetty extends AbstractLifecycleComponent {
         this.networkService = networkService;
         this.authentication = authentication;
         this.nettyBootstrap = nettyBootstrap;
+        this.transport = transport;
+        this.pageCacheRecycler = pageCacheRecycler;
 
         if (SslSettings.isPSQLSslEnabled(settings)) {
             namedLogger.info("PSQL SSL support is enabled.");
@@ -161,6 +174,11 @@ public class PostgresNetty extends AbstractLifecycleComponent {
                 PostgresWireProtocol postgresWireProtocol = new PostgresWireProtocol(
                     sqlOperations,
                     userManager::getAccessControl,
+                    chPipeline -> {
+                        var nettyTcpChannel = new Netty4TcpChannel(ch, true, "default", ch.newSucceededFuture());
+                        ch.attr(Netty4Transport.CHANNEL_KEY).set(nettyTcpChannel);
+                        chPipeline.addLast("dispatcher", new Netty4MessageChannelHandler(pageCacheRecycler, transport));
+                    },
                     authentication,
                     sslContextProvider);
                 pipeline.addLast("frame-decoder", postgresWireProtocol.decoder);

@@ -53,7 +53,6 @@ import org.elasticsearch.common.unit.ByteSizeValue;
 import org.elasticsearch.common.util.BigArrays;
 import org.elasticsearch.common.util.PageCacheRecycler;
 import org.elasticsearch.common.util.concurrent.ConcurrentCollections;
-import org.elasticsearch.common.util.concurrent.CountDown;
 import org.elasticsearch.indices.breaker.CircuitBreakerService;
 import org.elasticsearch.monitor.jvm.JvmInfo;
 import org.elasticsearch.node.Node;
@@ -128,7 +127,7 @@ public abstract class TcpTransport extends AbstractLifecycleComponent implements
     private volatile BoundTransportAddress boundAddress;
 
     private final TransportHandshaker handshaker;
-    private final TransportKeepAlive keepAlive;
+    final TransportKeepAlive keepAlive;
     private final OutboundHandler outboundHandler;
     private final InboundHandler inboundHandler;
     private final ResponseHandlers responseHandlers = new ResponseHandlers();
@@ -190,7 +189,7 @@ public abstract class TcpTransport extends AbstractLifecycleComponent implements
 
     public final class NodeChannels extends CloseableConnection {
         private final Map<TransportRequestOptions.Type, ConnectionProfile.ConnectionTypeHandle> typeMapping;
-        private final List<TcpChannel> channels;
+        final List<TcpChannel> channels;
         private final DiscoveryNode node;
         private final Version version;
         private final boolean compress;
@@ -200,7 +199,7 @@ public abstract class TcpTransport extends AbstractLifecycleComponent implements
             this.node = node;
             this.channels = Collections.unmodifiableList(channels);
             assert channels.size() == connectionProfile.getNumConnections() : "expected channels size to be == "
-                + connectionProfile.getNumConnections() + " but was: [" + channels.size() + "]";
+               + connectionProfile.getNumConnections() + " but was: [" + channels.size() + "]";
             typeMapping = new EnumMap<>(TransportRequestOptions.Type.class);
             for (ConnectionProfile.ConnectionTypeHandle handle : connectionProfile.getHandles()) {
                 for (TransportRequestOptions.Type type : handle.getTypes())
@@ -312,7 +311,7 @@ public abstract class TcpTransport extends AbstractLifecycleComponent implements
             }
         }
         ChannelsConnectedListener channelsConnectedListener = new ChannelsConnectedListener(
-            node,
+            this, node,
             connectionProfile,
             channels,
             new ThreadedActionListener<>(logger, threadPool, ThreadPool.Names.GENERIC, listener, false)
@@ -917,70 +916,7 @@ public abstract class TcpTransport extends AbstractLifecycleComponent implements
         return requestHandlers;
     }
 
-    private final class ChannelsConnectedListener implements ActionListener<Void> {
-
-        private final DiscoveryNode node;
-        private final ConnectionProfile connectionProfile;
-        private final List<TcpChannel> channels;
-        private final ActionListener<Transport.Connection> listener;
-        private final CountDown countDown;
-
-        private ChannelsConnectedListener(DiscoveryNode node,
-                                          ConnectionProfile connectionProfile,
-                                          List<TcpChannel> channels,
-                                          ActionListener<Transport.Connection> listener) {
-            this.node = node;
-            this.connectionProfile = connectionProfile;
-            this.channels = channels;
-            this.listener = listener;
-            this.countDown = new CountDown(channels.size());
-        }
-
-        @Override
-        public void onResponse(Void v) {
-            // Returns true if all connections have completed successfully
-            if (countDown.countDown()) {
-                final TcpChannel handshakeChannel = channels.get(0);
-                try {
-                    executeHandshake(node, handshakeChannel, connectionProfile, ActionListener.wrap(version -> {
-                        NodeChannels nodeChannels = new NodeChannels(node, channels, connectionProfile, version);
-                        long relativeMillisTime = threadPool.relativeTimeInMillis();
-                        nodeChannels.channels.forEach(ch -> {
-                            // Mark the channel init time
-                            ch.getChannelStats().markAccessed(relativeMillisTime);
-                            ch.addCloseListener(ActionListener.wrap(nodeChannels::close));
-                        });
-                        keepAlive.registerNodeConnection(nodeChannels.channels, connectionProfile);
-                        listener.onResponse(nodeChannels);
-                    }, e -> closeAndFail(e instanceof ConnectTransportException ?
-                        e : new ConnectTransportException(node, "general node connection failure", e))));
-                } catch (Exception ex) {
-                    closeAndFail(ex);
-                }
-            }
-        }
-
-        @Override
-        public void onFailure(Exception ex) {
-            if (countDown.fastForward()) {
-                closeAndFail(new ConnectTransportException(node, "connect_exception", ex));
-            }
-        }
-
-        public void onTimeout() {
-            if (countDown.fastForward()) {
-                closeAndFail(new ConnectTransportException(node, "connect_timeout[" + connectionProfile.getConnectTimeout() + "]"));
-            }
-        }
-
-        private void closeAndFail(Exception e) {
-            try {
-                CloseableChannel.closeChannels(channels, false);
-            } catch (Exception ex) {
-                e.addSuppressed(ex);
-            } finally {
-                listener.onFailure(e);
-            }
-        }
+    public OutboundHandler outboundHandler() {
+        return outboundHandler;
     }
 }

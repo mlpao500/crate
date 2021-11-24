@@ -29,6 +29,7 @@ import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.settings.Setting;
 import org.elasticsearch.common.settings.Settings;
+import org.elasticsearch.transport.RemoteCluster;
 
 import java.io.IOException;
 import java.net.URLDecoder;
@@ -41,8 +42,6 @@ import java.util.Objects;
 import java.util.Set;
 import java.util.function.Function;
 
-import static org.elasticsearch.transport.RemoteConnectionStrategy.REMOTE_CONNECTION_MODE;
-import static org.elasticsearch.transport.SniffConnectionStrategy.REMOTE_CLUSTER_SEEDS;
 
 public class ConnectionInfo implements Writeable {
 
@@ -62,8 +61,8 @@ public class ConnectionInfo implements Writeable {
         USERNAME.getKey(),
         PASSWORD.getKey(),
         SSLMODE.getKey(),
-        REMOTE_CONNECTION_MODE.getKey(),
-        REMOTE_CLUSTER_SEEDS.getKey()
+        RemoteCluster.REMOTE_CONNECTION_MODE.getKey(),
+        RemoteCluster.REMOTE_CLUSTER_SEEDS.getKey()
     );
 
     private static final String DEFAULT_PORT = "4300";

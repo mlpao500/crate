@@ -20,13 +20,18 @@
 package org.elasticsearch.action;
 
 import io.crate.common.CheckedSupplier;
+import io.crate.exceptions.Exceptions;
+
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.common.CheckedConsumer;
 import io.crate.common.CheckedFunction;
 import org.elasticsearch.common.CheckedRunnable;
+import org.elasticsearch.transport.Transport;
+import org.elasticsearch.transport.Transport.Connection;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.CompletableFuture;
 import java.util.function.BiConsumer;
 import java.util.function.Consumer;
 
@@ -291,6 +296,21 @@ public interface ActionListener<Response> {
             @Override
             public void onFailure(Exception e) {
                 onFailure.accept(delegate, e);
+            }
+        };
+    }
+
+    static <T> ActionListener<T> setCompletableFuture(CompletableFuture<T> result) {
+        return new ActionListener<T>() {
+
+            @Override
+            public void onResponse(T response) {
+                result.complete(response);
+            }
+
+            @Override
+            public void onFailure(Exception e) {
+                result.completeExceptionally(e);
             }
         };
     }

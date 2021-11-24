@@ -19,12 +19,11 @@
 
 package org.elasticsearch.transport.netty4;
 
-import io.netty.buffer.ByteBuf;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelDuplexHandler;
-import io.netty.channel.ChannelFuture;
-import io.netty.channel.ChannelHandlerContext;
-import io.netty.channel.ChannelPromise;
+import java.nio.channels.ClosedChannelException;
+import java.util.ArrayDeque;
+import java.util.Queue;
+import java.util.function.BiConsumer;
+
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.common.bytes.BytesReference;
@@ -33,30 +32,33 @@ import org.elasticsearch.common.lease.Releasables;
 import org.elasticsearch.common.util.PageCacheRecycler;
 import org.elasticsearch.threadpool.ThreadPool;
 import org.elasticsearch.transport.InboundPipeline;
+import org.elasticsearch.transport.TcpChannel;
 import org.elasticsearch.transport.Transport;
 import org.elasticsearch.transport.Transports;
 
-import java.nio.channels.ClosedChannelException;
-import java.util.ArrayDeque;
-import java.util.Queue;
+import io.netty.buffer.ByteBuf;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelDuplexHandler;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelHandlerContext;
+import io.netty.channel.ChannelPromise;
 
 /**
  * A handler (must be the last one!) that does size based frame decoding and forwards the actual message
  * to the relevant action.
  */
-final class Netty4MessageChannelHandler extends ChannelDuplexHandler {
+public final class Netty4MessageChannelHandler extends ChannelDuplexHandler {
 
-    private final Netty4Transport transport;
-
+    private final InboundPipeline pipeline;
+    private final BiConsumer<TcpChannel, Exception> onException;
     private final Queue<WriteOperation> queuedWrites = new ArrayDeque<>();
 
     private WriteOperation currentWrite;
-    private final InboundPipeline pipeline;
 
-    Netty4MessageChannelHandler(PageCacheRecycler recycler, Netty4Transport transport) {
-        this.transport = transport;
+    public Netty4MessageChannelHandler(PageCacheRecycler recycler, Netty4Transport transport) {
         final ThreadPool threadPool = transport.getThreadPool();
         final Transport.RequestHandlers requestHandlers = transport.getRequestHandlers();
+        this.onException = transport::onException;
         this.pipeline = new InboundPipeline(
             transport.getVersion(),
             transport.getStatsTracker(),
@@ -66,6 +68,11 @@ final class Netty4MessageChannelHandler extends ChannelDuplexHandler {
             requestHandlers::getHandler,
             transport::inboundMessage
         );
+    }
+
+    public Netty4MessageChannelHandler(InboundPipeline pipeline, BiConsumer<TcpChannel, Exception> onException) {
+        this.pipeline = pipeline;
+        this.onException = onException;
     }
 
     @Override
@@ -88,9 +95,9 @@ final class Netty4MessageChannelHandler extends ChannelDuplexHandler {
         final Throwable newCause = unwrapped != null ? unwrapped : cause;
         Netty4TcpChannel tcpChannel = ctx.channel().attr(Netty4Transport.CHANNEL_KEY).get();
         if (newCause instanceof Error) {
-            transport.onException(tcpChannel, new Exception(newCause));
+            onException.accept(tcpChannel, new Exception(newCause));
         } else {
-            transport.onException(tcpChannel, (Exception) newCause);
+            onException.accept(tcpChannel, (Exception) newCause);
         }
     }
 
