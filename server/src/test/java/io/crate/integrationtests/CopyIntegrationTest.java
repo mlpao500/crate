@@ -22,12 +22,14 @@
 package io.crate.integrationtests;
 
 import com.carrotsearch.randomizedtesting.LifecycleScope;
+import io.crate.action.sql.SQLOperations;
 import io.crate.execution.engine.collect.files.FileReadingIterator;
 import io.crate.execution.engine.collect.sources.FileCollectSource;
 import io.crate.testing.SQLResponse;
+import io.crate.testing.SQLTransportExecutor;
 import io.crate.testing.UseJdbc;
+import org.elasticsearch.client.Client;
 import org.elasticsearch.test.ESIntegTestCase;
-import org.elasticsearch.threadpool.ThreadPool;
 import org.junit.Rule;
 import org.junit.Test;
 import org.junit.rules.TemporaryFolder;
@@ -47,6 +49,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
@@ -858,26 +861,31 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
 
         Path tmpDir = newTempDir(LifecycleScope.TEST);
         Path target = Files.createDirectories(tmpDir.resolve("target"));
-        tmpFileWithLines(Arrays.asList(("{\"a\":987654321},".repeat(200) + "{\"a\":\"fail here\"}," +
-                                        "{\"a\":123456789},".repeat(200)).split(",")),
+        tmpFileWithLines(Arrays.asList(("{\"a\":987654321},".repeat(400) + "{\"a\":\"fail here\"}," +
+                                        "{\"a\":123456789},".repeat(400)).split(",")),
                          "data1.json",
                          target);
 
         execute("CREATE TABLE t (a int)");
         execute(
-            "COPY t FROM ? WITH (bulk_size = 1, fail_fast = false, shared = true)",
+            "COPY t FROM ? WITH (bulk_size = 1, fail_fast = false, shared = true)", // fail_fast = false
             new Object[]{target.toUri().toString() + "*"});
         refresh();
         execute("select * from t");
-        assertThat(response.rowCount(), is(400L));
+        assertThat(response.rowCount(), is(800L));
+
+        execute("delete from t");
+        refresh();
+
+        execute("set global overload_protection.dml.initial_concurrency = 2");
+        execute("set global overload_protection.dml.max_concurrency = 2");
+        execute("set global overload_protection.dml.queue_size = 2");
 
         int maxTry = 100;
         while (maxTry-- > 0) {
-            execute("drop table if exists t");
-            execute("CREATE TABLE t (a int)");
             try {
                 execute(
-                    "COPY t FROM ? WITH (bulk_size = 1, fail_fast = true, shared = true)",
+                    "COPY t FROM ? WITH (bulk_size = 1, fail_fast = true, shared = true)", // fail_fast = true
                     new Object[]{target.toUri().toString() + "*"});
                 fail();
             } catch (Exception e) {
@@ -887,8 +895,16 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
                 }
             }
             refresh();
+            try {
+                assertNoTasksAreLeftOpen(); // give a little time for upsert actions to finish
+            } catch (AssertionError ignored) {
+            }
+
             execute("select * from t");
-            if (response.rowCount() < 400L) {
+            if (response.rowCount() < 800L * (100 - maxTry)) {
+                execute("reset global overload_protection.dml.initial_concurrency");
+                execute("reset global overload_protection.dml.max_concurrency");
+                execute("reset global overload_protection.dml.queue_size");
                 return;
             }
         }
@@ -902,8 +918,8 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
 
         Path tmpDir = newTempDir(LifecycleScope.TEST);
         Path target = Files.createDirectories(tmpDir.resolve("target"));
-        tmpFileWithLines(Arrays.asList(("{\"a\":987654321},".repeat(200) + "{\"a\":\"fail here\"}," +
-                                        "{\"a\":123456789},".repeat(200)).split(",")),
+        tmpFileWithLines(Arrays.asList(("{\"a\":987654321},".repeat(50) + "{\"a\":\"fail here\"}," +
+                                        "{\"a\":123456789},".repeat(50)).split(",")),
                          "data1.json",
                          target);
 
@@ -913,12 +929,17 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
             new Object[]{target.toUri().toString() + "*"});
         refresh();
         execute("select * from t");
-        assertThat(response.rowCount(), is(400L * cluster().numDataNodes()));
+        assertThat(response.rowCount(), is(100L * cluster().numDataNodes()));
+
+        execute("delete from t");
+        refresh();
+
+        execute("set global overload_protection.dml.initial_concurrency = 2");
+        execute("set global overload_protection.dml.max_concurrency = 2");
+        execute("set global overload_protection.dml.queue_size = 2");
 
         int maxTry = 100;
         while (maxTry-- > 0) {
-            execute("drop table if exists t");
-            execute("CREATE TABLE t (a int)");
             try {
                 execute(
                     "COPY t FROM ? WITH (bulk_size = 1, fail_fast = true, shared = false)",
@@ -931,8 +952,16 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
                 }
             }
             refresh();
+            try {
+                assertNoTasksAreLeftOpen(); // give a little time for upsert actions to finish
+            } catch (AssertionError ignored) {
+            }
+
             execute("select * from t");
-            if (response.rowCount() < 400L * cluster().numDataNodes()) {
+            if (response.rowCount() < (100L * cluster().numDataNodes()) * (100 - maxTry)) {
+                execute("reset global overload_protection.dml.initial_concurrency");
+                execute("reset global overload_protection.dml.max_concurrency");
+                execute("reset global overload_protection.dml.queue_size");
                 return;
             }
         }
@@ -954,86 +983,162 @@ public class CopyIntegrationTest extends SQLHttpIntegrationTest {
         return null;
     }
 
-    @AwaitsFix(bugUrl = "https://github.com/crate/crate/issues/11956")
+    private void execCopyFromOnGivenExecutor(SQLTransportExecutor executor, String handlerNodeName, boolean failOnHandlerNode) throws Exception {
+
+        int maxTry = 100;
+        for(int idx = 0; idx < maxTry; idx++) { // retry in case of fail_fast unobserved
+            try {
+                executor.exec("create table if not exists tbl (a int)");
+                executor.ensureGreen();
+                executor.exec("delete from tbl");
+                executor.exec("refresh table tbl");
+
+                SQLResponse response;
+                response = executor.exec("select distinct id, node['name'], node['id'] from sys.shards where table_name = 'tbl' and primary = 'true'");
+                List<String> shardIds = new ArrayList<>();
+                List<String> nodeNames = new ArrayList<>();
+                List<String> nodeIds = new ArrayList<>();
+                for (int i = 0; i < response.rowCount(); i++) {
+                    shardIds.add((String) "" + response.rows()[i][0]);
+                    nodeNames.add((String) response.rows()[i][1]);
+                    nodeIds.add((String) response.rows()[i][2]);
+                }
+
+                String handlerNodeId = null;
+                if (nodeNames.contains(handlerNodeName) == false) {
+                    throw new AssertionError("handlerNode happens to have no tbl shards");
+                    // internalCluster().dataNodeClient() seems to prevent this from happening.
+                } else {
+                    handlerNodeId = nodeIds.get(nodeNames.indexOf(handlerNodeName));
+                }
+
+                // find a non-handler node containing a tbl shard
+                String nonHandlerNodeId = null;
+                String nonHandlerNodeName = null;
+                for (int i = 0; i < shardIds.size(); i++) {
+                    nonHandlerNodeId = nodeIds.get(shardIds.indexOf("" + i));
+                    if (!(nonHandlerNodeId.equals(handlerNodeId))) {
+                        nonHandlerNodeName = nodeNames.get(shardIds.indexOf("" + i));
+                        break;
+                    }
+                }
+
+                if (handlerNodeId == null || nonHandlerNodeId == null) {
+                    fail("this should never happen");
+                }
+
+                int failingReaderNumber = FileCollectSource.getReaderNumber(new HashSet<>(nodeIds),
+                                                                            failOnHandlerNode ? handlerNodeId : nonHandlerNodeId);
+                int passingReaderNumber = FileCollectSource.getReaderNumber(new HashSet<>(nodeIds),
+                                                                            failOnHandlerNode ? nonHandlerNodeId : handlerNodeId);
+                int numRowsToCopy = (idx+1)*1000;
+                Path target = folder.newFolder().toPath();
+                URI failingUri = generateURIToBeConsumedByProvidedReaderNumber(
+                    target,
+                    Arrays.asList(("{\"a\":987654321}," + "{\"a\":\"fail here\"}").split(",")),
+                    failingReaderNumber,
+                    nodeIds.size());
+                URI passingUri = generateURIToBeConsumedByProvidedReaderNumber(
+                    target,
+                    Arrays.asList("{\"a\":123456789},".repeat(numRowsToCopy).split(",")),
+                    passingReaderNumber,
+                    nodeIds.size());
+                if (failingUri == null || passingUri == null) {
+                    throw new RuntimeException("two uris should be available to be copied from");
+                }
+                String exceptionMessage = null;
+                try {
+                    executor.exec("copy tbl from ? with (shared=true, fail_fast=true, bulk_size=2) return summary",
+                                  new Object[]{target.toUri().toString() + "*"});
+                    fail("copy stmt did not throw an exception");
+                } catch (Exception e) {
+                    exceptionMessage = e.getMessage();
+                    if (exceptionMessage == null || exceptionMessage.contains("failed to parse field") == false) {
+                        fail("Exception message:" + exceptionMessage);
+                    }
+                }
+
+                executor.exec("refresh table tbl");
+                try {
+                    assertNoTasksAreLeftOpen(); // give a little time for upsert actions to finish
+                } catch (AssertionError ignored) {
+                }
+
+                long count;
+
+                // bulk_size is 2 and with the failing URI containing 1 passing and 1 failing record, the 1 passing record must be inserted
+                response = executor.exec("select count(*) from tbl where a = '987654321'");
+                count = (long) response.rows()[0][0];
+                assertEquals(1L, count);
+
+                response = executor.exec("select count(*) from tbl where a = '123456789'");
+                count = (long) response.rows()[0][0];
+                // if the count is not less than numRowsToCopy, it is unclear whether fail_fast had any effect.
+                if (!(count > 0L && count < numRowsToCopy)) {
+                    throw new RuntimeException("try again as it is unclear whether fail_fast had any effect, count:" + count);
+                }
+
+                // parse the exception message to retrieve the nodeName that observed the URI error and trigger the kill signals
+                int begin = exceptionMessage.indexOf("NODE: ");
+                if (begin == -1) {
+                    fail("something went wrong with the expected exception message");
+                }
+                int end = exceptionMessage.indexOf("\n[URI");
+                if (end == -1) {
+                    fail("something went wrong with the expected exception message");
+                }
+                String failTriggeredNodeName = exceptionMessage.substring(begin + "NODE: ".length(), end);
+
+                if (failTriggeredNodeName.equals(failOnHandlerNode ? handlerNodeName : nonHandlerNodeName) == false) {
+                    fail("nodeName should've been assigned to ingest the failing URI then should've triggered the failure");
+                    // the purpose of this is to test that fail_fast can be triggered from handlerNode as well as non-handlerNodes
+                    // since the handleNode will execute a CollectTask and a DownstreamRXTask whereas other data nodes will execute a CollectTask only
+                }
+                return;
+            } catch (RuntimeException e) {
+                // exceptions other than RuntimeException need investigations
+            }
+        }
+        fail("did not observe fail-fast within 100 iterations");
+    }
+
     @Test
     public void test_copy_from_with_fail_fast_property_can_kill_all_nodes_with_failure_from_single_node() throws Exception {
 
-        execute("create table tbl (a int)");
-        ensureGreen();
-        execute("select distinct node['name'], node['id'] from sys.shards where table_name = 'tbl'");
-        List<String> nodeNames = new ArrayList<>();
-        List<String> nodeIds = new ArrayList<>();
-        for (int i = 0; i < response.rowCount(); i++) {
-            nodeNames.add((String) response.rows()[i][0]);
-            nodeIds.add((String) response.rows()[i][1]);
-        }
+        var clientProvider = new SQLTransportExecutor.ClientProvider() {
 
-        for (int i = 0; i < nodeIds.size(); i++) {
+            private static final Client client = internalCluster().dataNodeClient();
 
-            // each node is assigned a readerNumber and based on URI.hashCode(), readerNumber, numReaders, the URIs will be assigned to a particular node to be consumed.
-            int readerNumber = FileCollectSource.getReaderNumber(nodeIds, nodeIds.get(i));
-
-            Path target = folder.newFolder().toPath();
-            URI failingUri = generateURIToBeConsumedByProvidedReaderNumber(
-                target,
-                Arrays.asList(("{\"a\":987654321}," + "{\"a\":\"fail here\"}").split(",")),
-                readerNumber, // making sure that every node gets a turn to consume failing uri.
-                nodeIds.size());
-            URI passingUri = generateURIToBeConsumedByProvidedReaderNumber(
-                target,
-                Arrays.asList("{\"a\":123456789},".repeat(10000).split(",")),
-                (readerNumber+1) % nodeIds.size(), // even with #nodes > 2, it does not matter who gets the passing uri.
-                nodeIds.size());
-            if (failingUri == null || passingUri == null) {
-                fail("two uris should be available to be copied from");
-            }
-            if (FileReadingIterator.moduloPredicateImpl(failingUri, readerNumber, nodeIds.size()) ==
-                FileReadingIterator.moduloPredicateImpl(passingUri, readerNumber, nodeIds.size())) {
-                fail("the two uris should not be consumed by the same node"); // the goal is to observe kill signals to spread across the nodes
+            @Override
+            public Client client() {
+                return client;
             }
 
-            String exceptionMessage = null;
-            try {
-                execute("copy tbl from ? with (shared=true, fail_fast=true, bulk_size=2) return summary",
-                        new Object[]{target.toUri().toString() + "*"});
-                fail();
-            } catch (Exception e) {
-                exceptionMessage = e.getMessage();
-                if (exceptionMessage == null || exceptionMessage.contains("failed to parse field") == false) {
-                    fail();
-                }
+            @Override
+            public String pgUrl() {
+                return null;
             }
 
-            refresh();
-            waitUntilThreadPoolTasksFinished(ThreadPool.Names.SEARCH);
-
-            // bulk_size is 2 and with the failing URI containing 1 passing and 1 failing record, the 1 passing record must be inserted
-            execute("select count(*) from tbl where a = '987654321'");
-            assertEquals(1L, (long) response.rows()[0][0]);
-
-            // if the count is not less than 10000L, it is unclear whether fail_fast had any effect.
-            execute("select count(*) from tbl where a = '123456789'");
-            assertTrue((long) response.rows()[0][0] < 10000L);
-
-            // parse the exception message to retrieve the nodeName that observed the URI error and trigger the kill signals
-            int begin = exceptionMessage.indexOf("NODE: ");
-            if (begin == -1) {
-                fail("something went wrong with the expected exception message");
+            @Override
+            public SQLOperations sqlOperations() {
+                return internalCluster().getInstance(SQLOperations.class, client.settings().get("node.name"));
             }
-            int end = exceptionMessage.indexOf("\n[URI");
-            if (end == -1) {
-                fail("something went wrong with the expected exception message");
-            }
-            String nodeName = exceptionMessage.substring(begin + "NODE: ".length(), end);
+        };
+        var handlerNodeExecutor = new SQLTransportExecutor(clientProvider);
 
-            if (nodeName.equals(nodeNames.get(i)) == false) {
-                fail("nodeNames.get(i) should've been assigned to ingest the failing URI then should've triggered the failure");
-                // the purpose of this is to test that fail_fast can be triggered from handlerNode as well as non-handlerNodes
-                // since the handleNode will execute a CollectTask and a DownstreamRXTask whereas other data nodes will execute a CollectTask only
-            }
+        handlerNodeExecutor.exec("set global overload_protection.dml.initial_concurrency = 2");
+        handlerNodeExecutor.exec("set global overload_protection.dml.max_concurrency = 2");
+        handlerNodeExecutor.exec("set global overload_protection.dml.queue_size = 2");
 
-            execute("delete from tbl");
-            refresh();
+        try {
+            execCopyFromOnGivenExecutor(handlerNodeExecutor, clientProvider.client().settings().get("node.name"), true);
+            execCopyFromOnGivenExecutor(handlerNodeExecutor, clientProvider.client().settings().get("node.name"), false);
+        } catch (AssertionError e) {
+            throw new AssertionError(e.getMessage());
+        } finally {
+            handlerNodeExecutor.exec("reset global overload_protection.dml.initial_concurrency");
+            handlerNodeExecutor.exec("reset global overload_protection.dml.max_concurrency");
+            handlerNodeExecutor.exec("reset global overload_protection.dml.queue_size");
         }
     }
 
