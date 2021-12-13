@@ -47,7 +47,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * server and server channels respond. Pings are only sent at the scheduled time if the channel did not send
  * and receive a message since the last ping.
  */
-final class TransportKeepAlive implements Closeable {
+public final class TransportKeepAlive implements Closeable {
 
     static final int PING_DATA_SIZE = -1;
 
@@ -76,7 +76,7 @@ final class TransportKeepAlive implements Closeable {
         this.lifecycle.moveToStarted();
     }
 
-    void registerNodeConnection(List<TcpChannel> nodeChannels, ConnectionProfile connectionProfile) {
+    public void registerNodeConnection(List<TcpChannel> nodeChannels, ConnectionProfile connectionProfile) {
         TimeValue pingInterval = connectionProfile.getPingInterval();
         if (pingInterval.millis() < 0) {
             return;

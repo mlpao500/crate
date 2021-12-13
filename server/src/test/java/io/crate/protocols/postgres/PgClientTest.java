@@ -136,26 +136,20 @@ public class PgClientTest {
             serverHost
         );
 
-        CompletableFuture<Connection> connect = pgClient.connect();
+        CompletableFuture<Connection> connect = pgClient.ensureConnected();
         Connection connection = connect.get(120, TimeUnit.SECONDS);
         System.out.println(connection);
         assertThat(connection.getNode(), is(serverHost));
 
-        // TODO: actions are not registered
-        Client remoteClient = pgClient.getRemoteClient(connection);
-        // FutureActionListener<PublicationsStateAction.Response, PublicationsStateAction.Response> listener = FutureActionListener.newInstance();
-        // client.execute(
-        //     PublicationsStateAction.INSTANCE,
-        //     new PublicationsStateAction.Request(List.of("pub1"), "crate"),
-        //     listener
-        // );
+        CompletableFuture<Connection> conn2 = pgClient.ensureConnected();
+        CompletableFuture<Connection> conn3 = pgClient.ensureConnected();
 
-        // io.crate.replication.logical.action.PublicationsStateAction.Response response = listener.get(5, TimeUnit.SECONDS);
-
-        // System.out.println(response);
+        conn2.get(120, TimeUnit.SECONDS);
+        conn3.get(120, TimeUnit.SECONDS);
 
         postgresNetty.close();
         pgClient.close();
-        remoteClient.close();
+
+        assertThat(connection.isClosed(), is(true));
     }
 }

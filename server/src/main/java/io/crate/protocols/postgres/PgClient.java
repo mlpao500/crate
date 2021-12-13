@@ -27,8 +27,11 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+import org.apache.lucene.store.AlreadyClosedException;
 import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionListenerResponseHandler;
@@ -48,6 +51,8 @@ import org.elasticsearch.transport.OutboundHandler;
 import org.elasticsearch.transport.RemoteClusterAwareRequest;
 import org.elasticsearch.transport.RemoteConnectionManager.ProxyConnection;
 import org.elasticsearch.transport.Transport;
+import org.elasticsearch.transport.TransportConnectionListener;
+import org.elasticsearch.transport.Transport.Connection;
 import org.elasticsearch.transport.TransportException;
 import org.elasticsearch.transport.TransportRequest;
 import org.elasticsearch.transport.TransportRequestOptions;
@@ -60,6 +65,7 @@ import org.elasticsearch.transport.netty4.Netty4Transport;
 import org.elasticsearch.transport.netty4.Netty4Utils;
 
 import io.crate.common.collections.BorrowedItem;
+import io.crate.exceptions.Exceptions;
 import io.crate.netty.NettyBootstrap;
 import io.netty.bootstrap.Bootstrap;
 import io.netty.buffer.ByteBuf;
@@ -73,19 +79,20 @@ import io.netty.channel.EventLoopGroup;
 import io.netty.channel.SimpleChannelInboundHandler;
 import io.netty.handler.codec.LengthFieldBasedFrameDecoder;
 
-public class PgClient implements Closeable {
+public class PgClient extends AbstractClient {
 
-    private final Settings settings;
     private final NettyBootstrap nettyBootstrap;
     private final Netty4Transport transport;
     private final PageCacheRecycler pageCacheRecycler;
     private final DiscoveryNode host;
     private final TransportService transportService;
+    private final AtomicBoolean isClosing = new AtomicBoolean(false);
 
+
+    private CompletableFuture<Transport.Connection> connectionFuture;
     private BorrowedItem<EventLoopGroup> eventLoopGroup;
     private Bootstrap bootstrap;
     private Channel channel;
-
 
     public PgClient(Settings nodeSettings,
                     TransportService transportService,
@@ -93,15 +100,55 @@ public class PgClient implements Closeable {
                     Netty4Transport transport,
                     PageCacheRecycler pageCacheRecycler,
                     DiscoveryNode host) {
-        this.settings = nodeSettings;
+        super(nodeSettings, transport.getThreadPool());
         this.transportService = transportService;
         this.nettyBootstrap = nettyBootstrap;
         this.transport = transport;
         this.pageCacheRecycler = pageCacheRecycler;
         this.host = host;
+        transportService.addConnectionListener(new TransportConnectionListener() {
+
+            @Override
+            public void onNodeDisconnected(DiscoveryNode node, Connection connection) {
+                System.out.println("####### disconnected " + node);
+            }
+        });
     }
 
-    public CompletableFuture<Transport.Connection> connect() {
+    public CompletableFuture<Transport.Connection> ensureConnected() {
+        if (isClosing.get()) {
+            return CompletableFuture.failedFuture(new AlreadyClosedException("PgClient is closed"));
+        }
+        CompletableFuture<Transport.Connection> future;
+        synchronized (this) {
+            if (connectionFuture == null) {
+                connectionFuture = new CompletableFuture<>();
+                future = connectionFuture;
+                // fall-through to connect
+            } else {
+                if (connectionFuture.isDone()) {
+                    Connection connection = connectionFuture.join();
+                    if (connection.isClosed() || connectionFuture.isCompletedExceptionally()) {
+                        connectionFuture = new CompletableFuture<>();
+                        future = connectionFuture;
+                        // fall-through to connect
+                    } else {
+                        return connectionFuture;
+                    }
+                } else {
+                    return connectionFuture;
+                }
+            }
+        }
+        try {
+            return connect(future);
+        } catch (Throwable t) {
+            future.completeExceptionally(t);
+            return future;
+        }
+    }
+
+    public CompletableFuture<Transport.Connection> connect(CompletableFuture<Connection> future) {
         bootstrap = new Bootstrap();
         eventLoopGroup = nettyBootstrap.getSharedEventLoopGroup(settings);
         bootstrap.group(eventLoopGroup.item());
@@ -109,13 +156,12 @@ public class PgClient implements Closeable {
         bootstrap.option(ChannelOption.TCP_NODELAY, TransportSettings.TCP_NO_DELAY.get(settings));
         bootstrap.option(ChannelOption.SO_KEEPALIVE, TransportSettings.TCP_KEEP_ALIVE.get(settings));
 
-        CompletableFuture<Transport.Connection> result = new CompletableFuture<>();
         bootstrap.handler(new ClientChannelInitializer(
             settings,
             host,
             transport,
             pageCacheRecycler,
-            result
+            future
         ));
         bootstrap.remoteAddress(host.getAddress().address());
         ChannelFuture connectFuture = bootstrap.connect();
@@ -126,27 +172,49 @@ public class PgClient implements Closeable {
             "default",
             connectFuture
         );
+        connectFuture.addListener(f -> {
+            if (!f.isSuccess()) {
+                Throwable cause = f.cause();
+                future.completeExceptionally(cause);
+            }
+        });
         channel.attr(Netty4Transport.CHANNEL_KEY).set(nettyChannel);
 
         ByteBuf buffer = channel.alloc().buffer();
         /// TODO: user must come from connectionInfo
         ClientMessages.sendStartupMessage(buffer, "doc", Map.of("user", "crate", "CrateDBTransport", "true"));
         channel.writeAndFlush(buffer);
-        return result;
+        return future;
     }
 
     @Override
-    public void close() throws IOException {
-        if (bootstrap != null) {
-            bootstrap = null;
-        }
-        if (eventLoopGroup != null) {
-            eventLoopGroup.close();
-            eventLoopGroup = null;
-        }
-        if (channel != null) {
-            Netty4Utils.closeChannels(List.of(channel));
-            channel = null;
+    public void close() {
+        if (isClosing.compareAndSet(false, true)) {
+            if (bootstrap != null) {
+                bootstrap = null;
+            }
+            if (eventLoopGroup != null) {
+                eventLoopGroup.close();
+                eventLoopGroup = null;
+            }
+            if (channel != null) {
+                try {
+                    Netty4Utils.closeChannels(List.of(channel));
+                } catch (IOException ignored) {
+                }
+                channel = null;
+            }
+            if (connectionFuture != null) {
+                try {
+                    if (connectionFuture.isDone()) {
+                        connectionFuture.join().close();
+                    } else {
+                        connectionFuture.cancel(true);
+                    }
+                } catch (Throwable ignored) {
+                }
+                connectionFuture = null;
+            }
         }
     }
 
@@ -254,6 +322,7 @@ public class PgClient implements Closeable {
                     long relativeMillisTime = this.transport.getThreadPool().relativeTimeInMillis();
                     tcpChannel.getChannelStats().markAccessed(relativeMillisTime);
                     tcpChannel.addCloseListener(ActionListener.wrap(connection::close));
+                    transport.keepAlive().registerNodeConnection(List.of(tcpChannel), connectionProfile);
                     result.complete(connection);
                 },
                 e -> {
@@ -335,15 +404,6 @@ public class PgClient implements Closeable {
     }
 
 
-    public Client getRemoteClient(Transport.Connection connection) {
-        return new TransportPgClient(
-            settings,
-            transportService,
-            transportService.getThreadPool(),
-            connection
-        );
-    }
-
     public static class TunneledConnection extends CloseableConnection {
 
         private final DiscoveryNode node;
@@ -404,63 +464,49 @@ public class PgClient implements Closeable {
         }
     }
 
-    private final class TransportPgClient extends AbstractClient {
-        private final Transport.Connection connection;
-        private final TransportService transportService;
+    @Override
+    protected <Request extends TransportRequest, Response extends TransportResponse> void doExecute(ActionType<Response> action,
+                                                                                                    Request request,
+                                                                                                    ActionListener<Response> listener) {
+        // TODO: Remove, this is temporary to be able to set breakpoints
+        var wrappedListener = new ActionListener<Response>() {
 
-        private TransportPgClient(Settings settings,
-                                  TransportService transportService,
-                                  ThreadPool threadPool,
-                                  Transport.Connection connection) {
-            super(settings, threadPool);
-            this.transportService = transportService;
-            this.connection = connection;
-        }
-
-        protected <Request extends TransportRequest, Response extends TransportResponse> void doExecute(
-                ActionType<Response> action,
-                Request request,
-                ActionListener<Response> listener) {
-
-            // TODO: Remove, this is temporary to be able to set breakpoints
-            var wrappedListener = new ActionListener<Response>() {
-
-                @Override
-                public void onResponse(Response response) {
-                    listener.onResponse(response);
-                }
-
-                @Override
-                public void onFailure(Exception e) {
-                    System.out.println("##################");
-                    e.printStackTrace();
-                    listener.onFailure(e);
-                }
-            };
-
-            if (request instanceof RemoteClusterAwareRequest remoteClusterAware) {
-                DiscoveryNode targetNode = remoteClusterAware.getPreferredTargetNode();
-                transportService.sendRequest(
-                    new ProxyConnection(connection, targetNode),
-                    action.name(),
-                    request,
-                    TransportRequestOptions.EMPTY,
-                    new ActionListenerResponseHandler<>(wrappedListener, action.getResponseReader())
-                );
-            } else {
-                transportService.sendRequest(
-                    connection,
-                    action.name(),
-                    request,
-                    TransportRequestOptions.EMPTY,
-                    new ActionListenerResponseHandler<>(wrappedListener, action.getResponseReader())
-                );
+            @Override
+            public void onResponse(Response response) {
+                listener.onResponse(response);
             }
-        }
 
-        @Override
-        public void close() {
-            connection.close();
-        }
+            @Override
+            public void onFailure(Exception e) {
+                System.out.println("##################");
+                e.printStackTrace();
+                listener.onFailure(e);
+            }
+        };
+        ensureConnected().whenComplete((connection, e) -> {
+            if (e != null) {
+                wrappedListener.onFailure(Exceptions.toRuntimeException(e));
+            } else {
+                if (request instanceof RemoteClusterAwareRequest remoteClusterAware) {
+                    DiscoveryNode targetNode = remoteClusterAware.getPreferredTargetNode();
+                    transportService.sendRequest(
+                        new ProxyConnection(connection, targetNode),
+                        action.name(),
+                        request,
+                        TransportRequestOptions.EMPTY,
+                        new ActionListenerResponseHandler<>(wrappedListener, action.getResponseReader())
+                    );
+                } else {
+                    transportService.sendRequest(
+                        connection,
+                        action.name(),
+                        request,
+                        TransportRequestOptions.EMPTY,
+                        new ActionListenerResponseHandler<>(wrappedListener, action.getResponseReader())
+                    );
+                }
+            }
+        });
+
     }
 }

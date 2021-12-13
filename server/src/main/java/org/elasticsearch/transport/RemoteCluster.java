@@ -122,10 +122,12 @@ public class RemoteCluster implements Closeable {
         IOUtils.close(toClose);
     }
 
-    public synchronized CompletableFuture<Client> connectAndGetClient() {
-        Client currentClient = client;
-        if (currentClient != null) {
-            return CompletableFuture.completedFuture(currentClient);
+    public CompletableFuture<Client> connectAndGetClient() {
+        synchronized (this) {
+            Client currentClient = client;
+            if (currentClient != null) {
+                return CompletableFuture.completedFuture(currentClient);
+            }
         }
         var futureClient = switch (connectionStrategy) {
             case SNIFF -> connectSniff();
@@ -133,7 +135,6 @@ public class RemoteCluster implements Closeable {
         };
         return futureClient.whenComplete((c, err) -> {
             client = c;
-            toClose.add(c);
         });
     }
 
@@ -144,7 +145,7 @@ public class RemoteCluster implements Closeable {
         }
         PgClient pgClient = pgClientFactory.createClient(toDiscoveryNode(hosts.get(0)));
         toClose.add(pgClient);
-        return pgClient.connect().thenApply(pgClient::getRemoteClient);
+        return pgClient.ensureConnected().thenApply(connection -> pgClient);
     }
 
     private CompletableFuture<Client> connectSniff() {

@@ -986,10 +986,10 @@ public class Node implements Closeable {
         toClose.add(() -> stopWatch.stop().start("transport"));
         toClose.add(injector.getInstance(TransportService.class));
 
-        toClose.add(() -> stopWatch.stop().start("remote_clusters"));
-        toClose.add(injector.getInstance(RemoteClusters.class));
         toClose.add(() -> stopWatch.stop().start("logical_replication_service"));
         toClose.add(injector.getInstance(LogicalReplicationService.class));
+        toClose.add(() -> stopWatch.stop().start("remote_clusters"));
+        toClose.add(injector.getInstance(RemoteClusters.class));
 
         toClose.add(() -> stopWatch.stop().start("gateway_meta_state"));
         toClose.add(injector.getInstance(GatewayMetaState.class));
