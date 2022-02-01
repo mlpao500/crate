@@ -33,6 +33,7 @@ import java.util.HashSet;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 import javax.annotation.Nullable;
 
@@ -88,11 +89,12 @@ import io.crate.metadata.table.Operation;
 @Singleton
 public class TransportShardUpsertAction extends TransportShardAction<ShardUpsertRequest, ShardUpsertRequest.Item> {
 
-    private static final String ACTION_NAME = "internal:crate:sql/data/write";
+    public static final String ACTION_NAME = "internal:crate:sql/data/write";
     private static final int MAX_RETRY_LIMIT = 100_000; // upper bound to prevent unlimited retries on unexpected states
 
     private final Schemas schemas;
     private final NodeContext nodeCtx;
+    private final AtomicLong idxCnt = new AtomicLong();
 
 
     @Inject
@@ -220,6 +222,7 @@ public class TransportShardUpsertAction extends TransportShardAction<ShardUpsert
                 item.source(),
                 XContentType.JSON
             );
+            logger.info("Replica item seqNo: {}", item.seqNo());
 
             Engine.IndexResult indexResult = indexShard.applyIndexOperationOnReplica(
                 item.seqNo(),
@@ -229,6 +232,10 @@ public class TransportShardUpsertAction extends TransportShardAction<ShardUpsert
                 false,
                 sourceToParse
             );
+            if (item.seqNo() == 100) {
+                throw new TransportReplicationAction.RetryOnReplicaException(indexShard.shardId(), "provoke retry");
+
+            }
             if (indexResult.getResultType() == Engine.Result.Type.MAPPING_UPDATE_REQUIRED) {
                 // Even though the primary waits on all nodes to ack the mapping changes to the master
                 // (see MappingUpdatedAction.updateMappingOnMaster) we still need to protect against missing mappings
