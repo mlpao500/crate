@@ -87,7 +87,7 @@ public class DropSubscriptionPlan implements Plan {
         // Drop setting and subscription
         actions.add(new ChainableAction<>(
             () -> {
-                FutureActionListener<AcknowledgedResponse, Long> listener = new FutureActionListener<>(r -> -1L);
+                FutureActionListener<AcknowledgedResponse, Long> listener = new FutureActionListener<>(r -> 1L);
                 var request = new DropSubscriptionRequest(analyzedDropSubscription.name(), analyzedDropSubscription.ifExists());
                 dependencies.dropSubscriptionAction().execute(request, listener);
                 return listener;

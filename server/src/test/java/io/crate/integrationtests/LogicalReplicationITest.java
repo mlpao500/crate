@@ -466,7 +466,6 @@ public class LogicalReplicationITest extends LogicalReplicationITestCase {
         var response = executeOnSubscriber("INSERT INTO doc.t1 (id) VALUES(3)");
         assertThat(response.rowCount(), is(1L));
 
-        Thread.sleep(500);
         response = executeOnSubscriber("INSERT INTO doc.t2 (id) VALUES(3)");
         assertThat(response.rowCount(), is(1L));
     }
