@@ -104,7 +104,7 @@ public class OperationTest extends ESTestCase {
             .build();
         assertThat(
             Operation.buildFromIndexSettingsAndState(replicatedIndexSettings, IndexMetadata.State.OPEN),
-            containsInAnyOrder(READ, ALTER_BLOCKS, ALTER_REROUTE, OPTIMIZE, REFRESH, COPY_TO, SHOW_CREATE)
+            containsInAnyOrder(READ, ALTER_BLOCKS, ALTER_REROUTE, OPTIMIZE, REFRESH, COPY_TO, SHOW_CREATE, ALTER_OPEN_CLOSE)
         );
     }
 }
