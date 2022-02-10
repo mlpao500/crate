@@ -129,9 +129,15 @@ public class WindowProjector {
         int arrayListElementOverHead = 32;
         RowAccountingWithEstimators accounting = new RowAccountingWithEstimators(
             Symbols.typeView(projection.standalone()), ramAccounting, arrayListElementOverHead);
-        Comparator<Object[]> cmpPartitionBy = partitions.isEmpty()
+
+        // No need to create partitions comparator if there are no window functions.
+        // For example, subselect of unused window aggregation can be pruned, and we don't need
+        // Comparator even if partition is not empty.
+        // see https://github.com/crate/crate/issues/12113
+        Comparator<Object[]> cmpPartitionBy = partitions.isEmpty() || numWindowFunctions == 0
             ? null
             : createComparator(createInputFactoryContext, new OrderBy(windowDefinition.partitions()));
+
         Comparator<Object[]> cmpOrderBy = createComparator(createInputFactoryContext, windowDefinition.orderBy());
         int numCellsInSourceRow = projection.standalone().size();
         ComputeFrameBoundary<Object[]> computeFrameStart = createComputeStartFrameBoundary(
