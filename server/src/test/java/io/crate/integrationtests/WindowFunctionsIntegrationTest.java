@@ -21,7 +21,6 @@
 
 package io.crate.integrationtests;
 
-import org.hamcrest.core.Is;
 import org.junit.Test;
 
 import static io.crate.testing.TestingHelpers.printedTable;
@@ -288,12 +287,5 @@ public class WindowFunctionsIntegrationTest extends SQLIntegrationTestCase {
                 "FROM t");
         assertThat(printedTable(response.rows()), is("1| [1]\n" +
                                                      "2| [1]\n"));
-    }
-
-    @Test
-    public void test_can_select_only_one_field_if_subquery_selects_this_field_and_window_func_over_another_field() {
-        execute("create table t (x int, y int)");
-        execute("select x from (select x, ROW_NUMBER() OVER (PARTITION BY y) from t) t1");
-        assertThat(printedTable(response.rows()), Is.is(""));
     }
 }
