@@ -24,6 +24,10 @@ package io.crate.integrationtests;
 import static com.carrotsearch.randomizedtesting.RandomizedTest.newTempDir;
 import static io.crate.integrationtests.CopyIntegrationTest.tmpFileWithLines;
 import static io.crate.testing.Asserts.assertThrowsMatches;
+import static io.crate.testing.MoreMatchers.withFeature;
+import static org.hamcrest.Matchers.allOf;
+import static org.hamcrest.Matchers.containsString;
+import static org.hamcrest.Matchers.instanceOf;
 import static org.hamcrest.Matchers.lessThan;
 import static org.hamcrest.core.Is.is;
 
@@ -34,7 +38,6 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
-import java.util.stream.Collectors;
 
 import org.apache.logging.log4j.Level;
 import org.apache.logging.log4j.LogManager;
@@ -169,8 +172,83 @@ public class CopyFromFailFastITest extends SQLIntegrationTestCase {
         assertThat((long) response.rows()[0][0], lessThan(50L));
     }
 
+    @TestLogging("io.crate.execution.dml.upsert:DEBUG")
+    @Test
+    public void test_copy_from_with_fail_fast_with_write_error_on_handler_node() throws Exception {
+        internalCluster().startNode();
+        internalCluster().startNode();
+        internalCluster().ensureAtLeastNumDataNodes(2);
+
+        execute("set global overload_protection.dml.initial_concurrency = 2");
+        execute("set global overload_protection.dml.max_concurrency = 2");
+        execute("set global overload_protection.dml.queue_size = 2");
+
+        execute("CREATE TABLE doc.t (a INT PRIMARY KEY, b INT) CLUSTERED INTO 2 SHARDS WITH (number_of_replicas=0)");
+
+        execute("SELECT node['name'] FROM sys.shards WHERE table_name='t' ORDER BY id");
+        var nodeNameOfShard0 = (String) response.rows()[0][0];
+
+        var clientProvider = new SQLTransportExecutor.ClientProvider() {
+
+            @Override
+            public Client client() {
+                return internalCluster().client(nodeNameOfShard0);
+            }
+
+            @Override
+            public String pgUrl() {
+                return null;
+            }
+
+            @Override
+            public SQLOperations sqlOperations() {
+                return internalCluster().getInstance(SQLOperations.class, nodeNameOfShard0);
+            }
+        };
+        var handlerNodeExecutor = new SQLTransportExecutor(clientProvider);
+
+        Path tmpDir = newTempDir(LifecycleScope.TEST);
+        Path target = Files.createDirectories(tmpDir.resolve("target"));
+        int numDocs = 100;
+
+        var indexMetadata = clusterService().state().getMetadata().index("t");
+        List<String> rows = new ArrayList<>();
+        for (int i = 0; i < numDocs; i++) {
+            String line;
+            // Ensure the failing doc will fail on shard id 0
+            if (i >= 20 && OperationRouting.generateShardId(indexMetadata, Integer.toString(i), null) == 0) {
+                line = "{\"a\":" + i + ", \"b\":\"fail here\"}";
+            } else {
+                line = "{\"a\":" + i + ", \"b\":" + i + "}";
+            }
+            rows.add(line);
+        }
+
+        tmpFileWithLines(rows, "data1.json", target);
+        assertExpectedLogMessages(
+            () -> assertThrowsMatches(
+                () -> handlerNodeExecutor.exec(
+                    "COPY doc.t FROM ? WITH (bulk_size = 1, fail_fast = true, shared= true)", // fail_fast = true
+                    new Object[]{target.toUri() + "*"}),
+                JobKilledException.class,
+                "failed to parse field [b] of type [integer]"
+            ),
+            new MockLogAppender.PatternSeenEventExcpectation(
+                "assert failure on node=" + nodeNameOfShard0,
+                "io.crate.execution.dml.upsert.TransportShardUpsertAction",
+                Level.DEBUG,
+                "Failed to execute upsert on nodeName="+nodeNameOfShard0 + ".*")
+        );
+
+        execute("SELECT COUNT(*) FROM doc.t");
+        assertThat((long) response.rows()[0][0], lessThan(50L));
+    }
+
     @Test
     public void test_copy_from_fail_fast_with_passing_uris_only() throws IOException {
+        internalCluster().startNode();
+        internalCluster().startNode();
+        internalCluster().ensureAtLeastNumDataNodes(2);
 
         Path tmpDir = newTempDir(LifecycleScope.TEST);
         Path target = Files.createDirectories(tmpDir.resolve("target"));
@@ -186,19 +264,25 @@ public class CopyFromFailFastITest extends SQLIntegrationTestCase {
 
         execute("CREATE TABLE t (a int)");
 
+        // with return summary
         execute("COPY t FROM ? WITH (fail_fast = true, shared = false)", new Object[]{target.toUri().toString() + "*"});
         refresh();
         execute("select * from t");
         assertThat(response.rowCount(), is(6L * cluster().numDataNodes()));
 
+        // without return summary
         execute("COPY t FROM ? WITH (fail_fast = true, shared = false) return summary", new Object[]{target.toUri().toString() + "*"});
         refresh();
         execute("select * from t");
         assertThat(response.rowCount(), is(6L * cluster().numDataNodes() * 2));
     }
 
+    @UseJdbc(0)
     @Test
-    public void test_copy_from_fail_fast_with_passing_and_failing_uris() throws IOException {
+    public void test_copy_from_fail_fast_messages_with_passing_and_failing_uris() throws IOException {
+        internalCluster().startNode();
+        internalCluster().startNode();
+        internalCluster().ensureAtLeastNumDataNodes(2);
 
         Path tmpDir = newTempDir(LifecycleScope.TEST);
         Path target = Files.createDirectories(tmpDir.resolve("target"));
@@ -220,39 +304,41 @@ public class CopyFromFailFastITest extends SQLIntegrationTestCase {
                          "failing2.json",
                          target);
 
-        String expectedMessage = "[URI: failing1.json, ERRORS: {failed to parse field [a] of type [integer]={count=1, line_numbers=[3]}}]" +
-                                 "[URI: failing2.json, ERRORS: {mapping set to strict, dynamic introduction of [b] within [default] is not allowed={count=1, line_numbers=[5]}}]" +
-                                 "[URI: passing1.json, ERRORS: {}][URI: passing2.json, ERRORS: {}][URI: passing3.json, ERRORS: {}]";
-
         execute("CREATE TABLE t (a int)");
 
-        try {
-            execute("COPY t FROM ? WITH (fail_fast = true, shared = false)",
-                    new Object[]{target.toUri().toString() + "*"});
-        } catch (Exception e) {
-            String exceptionMessage = e.getMessage();
-            if (e.getMessage() == null || e.getMessage().isEmpty()) {
-                fail("expect a message from this exception");
-            }
-            exceptionMessage = exceptionMessage.replaceAll("file:///.*/target/", "").replaceAll("],","]");
-            exceptionMessage = Arrays.stream(exceptionMessage.split("\n")).filter(s -> s.startsWith("[URI:")).sorted().collect(
-                Collectors.joining());
-            assertThat(exceptionMessage, is(expectedMessage));
-        }
+        //without return summary
+        assertThrowsMatches(
+            () -> execute("COPY t FROM ? WITH (fail_fast = true, shared = false)",
+                new Object[]{target.toUri() + "*"}),
+                allOf(is(instanceOf(JobKilledException.class)),
+                      withFeature(Throwable::getMessage,
+                                  "message",
+                                  allOf(containsString("failing1.json, ERRORS: {failed to parse field [a] of type [integer]={count=1, line_numbers=[3]}}]"),
+                                        containsString("failing2.json, ERRORS: {mapping set to strict, dynamic introduction of [b] within [default] is not allowed={count=1, line_numbers=[5]}}]"),
+                                        containsString("passing1.json, ERRORS: {}]"),
+                                        containsString("passing2.json, ERRORS: {}]"),
+                                        containsString("passing3.json, ERRORS: {}]")
+                                  )
+                      )
+                )
+        );
 
-        try {
-            execute("COPY t FROM ? WITH (fail_fast = true, shared = false) return summary",
-                    new Object[]{target.toUri().toString() + "*"});
-        } catch (Exception e) {
-            String exceptionMessage = e.getMessage();
-            if (e.getMessage() == null || e.getMessage().isEmpty()) {
-                fail("expect a message from this exception");
-            }
-            exceptionMessage = exceptionMessage.replaceAll("file:///.*/target/", "").replaceAll("],","]");
-            exceptionMessage = Arrays.stream(exceptionMessage.split("\n")).filter(s -> s.startsWith("[URI:")).sorted().collect(
-                Collectors.joining());
-            assertThat(exceptionMessage, is(expectedMessage));
-        }
+        //with return summary
+        assertThrowsMatches(
+            () -> execute("COPY t FROM ? WITH (fail_fast = true, shared = false) RETURN SUMMARY",
+                          new Object[]{target.toUri() + "*"}),
+            allOf(is(instanceOf(JobKilledException.class)),
+                  withFeature(Throwable::getMessage,
+                              "message",
+                              allOf(containsString("failing1.json, ERRORS: {failed to parse field [a] of type [integer]={count=1, line_numbers=[3]}}]"),
+                                    containsString("failing2.json, ERRORS: {mapping set to strict, dynamic introduction of [b] within [default] is not allowed={count=1, line_numbers=[5]}}]"),
+                                    containsString("passing1.json, ERRORS: {}]"),
+                                    containsString("passing2.json, ERRORS: {}]"),
+                                    containsString("passing3.json, ERRORS: {}]")
+                              )
+                  )
+            )
+        );
     }
 
     private void assertExpectedLogMessages(Runnable command,
